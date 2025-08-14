@@ -1,38 +1,58 @@
-name: Check for Docker Image Update and Deploy
+name: Check GHCR Image Update and Deploy
 
 on:
-  # 每天的每个小时的第15分钟执行一次 (可以自己调整)
+  # 每小时的第30分钟执行一次 (您可以自己调整)
   schedule:
-    - cron: '15 * * * *'
-  # 也允许手动触发，方便测试
+    - cron: '30 * * * *'
+  # 允许手动触发，方便您随时测试
   workflow_dispatch:
 
-# 环境变量，请修改为您要监控的镜像
+# --- ⚠️ 请在这里修改为您要监控的镜像 ---
 env:
-  IMAGE_TO_CHECK: "jellyfin/jellyfin" # <--- ⚠️ 修改为您要监控的镜像名
+  IMAGE_TO_CHECK: "moontechlab/lunatv" # 只需要 "组织名/镜像名"
+  IMAGE_TAG: "latest"                  # 镜像的标签
+# ------------------------------------
 
 jobs:
   check-for-update:
     runs-on: ubuntu-latest
+    # 给工作流赋予读取公共包和写入本仓库内容的权限
+    permissions:
+      packages: read
+      contents: write
+      
     steps:
       # 步骤1: 检出当前仓库代码，这样才能读写 last_digest.txt 文件
       - name: Checkout Repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # 步骤2: 读取上一次记录的镜像Digest
+      # 步骤2: 读取上一次记录的镜像Digest (如果文件不存在，则为空)
       - name: Read Last Known Digest
         id: last_digest
-        run: echo "digest=$(cat last_digest.txt)" >> $GITHUB_OUTPUT
+        run: |
+          if [ -f last_digest.txt ]; then
+            echo "digest=$(cat last_digest.txt)" >> $GITHUB_OUTPUT
+          else
+            echo "digest=''" >> $GITHUB_OUTPUT
+          fi
 
-      # 步骤3: 从Docker Hub获取最新的镜像Digest
-      # 这是整个脚本的核心，它通过API查询镜像信息
-      - name: Get Latest Image Digest from Docker Hub
+      # 步骤3: 从 GHCR 获取最新的镜像 Digest
+      # 这是针对 GHCR 修改后的核心步骤
+      - name: Get Latest Image Digest from GHCR
         id: new_digest
         run: |
-          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${{ env.IMAGE_TO_CHECK }}:pull" | jq -r .token)
-          DIGEST=$(curl -s -H "Accept: application/vnd.docker.distribution.manifest.v2+json" -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${{ env.IMAGE_TO_CHECK }}/manifests/latest" | grep -o 'sha256:[a-f0-9]*' | head -n 1)
+          DIGEST=$(curl -sIL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                        -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                        "https://ghcr.io/v2/${{ env.IMAGE_TO_CHECK }}/manifests/${{ env.IMAGE_TAG }}" \
+                        | grep -i 'Docker-Content-Digest' | awk '{print $2}' | tr -d '\r')
+
+          if [ -z "$DIGEST" ]; then
+            echo "::error::Failed to fetch image digest. Check image name (ghcr.io/${{ env.IMAGE_TO_CHECK }}:${{ env.IMAGE_TAG }}) and permissions."
+            exit 1
+          fi
+
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-          echo "Latest digest for ${{ env.IMAGE_TO_CHECK }} is ${DIGEST}"
+          echo "Latest digest for ghcr.io/${{ env.IMAGE_TO_CHECK }}:${{ env.IMAGE_TAG }} is ${DIGEST}"
 
       # 步骤4: 比较新旧Digest，如果不同，则触发部署
       - name: Compare Digests and Trigger Deploy
@@ -47,13 +67,13 @@ jobs:
           echo "${{ steps.new_digest.outputs.digest }}" > last_digest.txt
           
           # 配置Git，以便能将新Digest写回仓库
-          git config --global user.name 'GitHub Actions'
-          git config --global user.email 'actions@github.com'
+          git config --global user.name 'GitHub Actions Bot'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add last_digest.txt
-          git commit -m "Update image digest to ${{ steps.new_digest.outputs.digest }}"
+          git commit -m "Update image digest for ${{ env.IMAGE_TO_CHECK }}"
           git push
         
       # 如果Digest相同，则什么都不做
       - name: No Update Found
         if: steps.last_digest.outputs.digest == steps.new_digest.outputs.digest
-        run: echo "👍 Image is up to date. No action needed."
+        run: echo "👍 Image is up to date (Digest: ${{ steps.new_digest.outputs.digest }}). No action needed."
