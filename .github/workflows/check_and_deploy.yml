@@ -1,79 +1,119 @@
-name: Check GHCR Image Update and Deploy
+name: Check GHCR Image and Redeploy via Claw Cloud API
 
 on:
-  # 每小时的第30分钟执行一次 (您可以自己调整)
   schedule:
-    - cron: '30 * * * *'
+    # 每天的每个小时的第5分钟执行 (您可以自己调整)
+    - cron: '5 * * * *'
   # 允许手动触发，方便您随时测试
   workflow_dispatch:
 
 # --- ⚠️ 请在这里修改为您要监控的镜像 ---
 env:
-  IMAGE_TO_CHECK: "moontechlab/lunatv" # 只需要 "组织名/镜像名"
-  IMAGE_TAG: "latest"                  # 镜像的标签
+  IMAGE_TO_CHECK: "moontechlab/lunatv"
+  IMAGE_TAG: "latest"
 # ------------------------------------
 
 jobs:
-  check-for-update:
+  check-and-redeploy:
     runs-on: ubuntu-latest
-    # 给工作流赋予读取公共包和写入本仓库内容的权限
     permissions:
       packages: read
       contents: write
-      
+
     steps:
-      # 步骤1: 检出当前仓库代码，这样才能读写 last_digest.txt 文件
+      # 步骤 1: 检出仓库代码，以读写 last_digest.txt
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      # 步骤2: 读取上一次记录的镜像Digest (如果文件不存在，则为空)
+      # 步骤 2: 读取上一次记录的镜像 Digest
       - name: Read Last Known Digest
         id: last_digest
         run: |
-          if [ -f last_digest.txt ]; then
-            echo "digest=$(cat last_digest.txt)" >> $GITHUB_OUTPUT
-          else
-            echo "digest=''" >> $GITHUB_OUTPUT
-          fi
+          if [ -f last_digest.txt ]; then echo "digest=$(cat last_digest.txt)" >> $GITHUB_OUTPUT; else echo "digest=''" >> $GITHUB_OUTPUT; fi
 
-      # 步骤3: 从 GHCR 获取最新的镜像 Digest
-      # 这是针对 GHCR 修改后的核心步骤
+      # 步骤 3: 从 GHCR 获取最新的镜像 Digest
       - name: Get Latest Image Digest from GHCR
         id: new_digest
         run: |
-          DIGEST=$(curl -sIL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                        -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-                        "https://ghcr.io/v2/${{ env.IMAGE_TO_CHECK }}/manifests/${{ env.IMAGE_TAG }}" \
-                        | grep -i 'Docker-Content-Digest' | awk '{print $2}' | tr -d '\r')
+          DIGEST=$(curl -sIL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" "https://ghcr.io/v2/${{ env.IMAGE_TO_CHECK }}/manifests/${{ env.IMAGE_TAG }}" | grep -i 'Docker-Content-Digest' | awk '{print $2}' | tr -d '\r')
+          if [ -z "$DIGEST" ]; then echo "::error::Failed to fetch image digest."; exit 1; fi
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+          echo "Latest digest for ghcr.io/${{ env.IMAGE_TO_CHECK }} is ${DIGEST}"
 
-          if [ -z "$DIGEST" ]; then
-            echo "::error::Failed to fetch image digest. Check image name (ghcr.io/${{ env.IMAGE_TO_CHECK }}:${{ env.IMAGE_TAG }}) and permissions."
+      # 步骤 4: 比较 Digest，如果不同，则执行部署
+      - name: Compare, Login, and Redeploy if Needed
+        if: steps.last_digest.outputs.digest != steps.new_digest.outputs.digest
+        # 使用 jq 工具来处理 JSON 数据
+        run: |
+          echo "✅ New image found! Triggering Claw Cloud redeployment via private API..."
+
+          # 1. 模拟登录 Claw Cloud API 获取包含 kubeconfig 和 token 的授权对象
+          # 这个 API 端点是根据通用实践猜测的，如果失效，需要在开发者工具中找到登录请求的URL
+          AUTH_PAYLOAD=$(curl -s -X POST 'https://www.clawcloud.net/api/login' \
+            -H 'Content-Type: application/json' \
+            -d '{"username": "${{ secrets.CLAW_CLOUD_USERNAME }}", "password": "${{ secrets.CLAW_CLOUD_PASSWORD }}"}')
+
+          # 检查登录是否成功，以及是否返回了需要的 kubeconfig 和 token
+          if ! echo "$AUTH_PAYLOAD" | jq -e '.data.kubeconfig' > /dev/null || ! echo "$AUTH_PAYLOAD" | jq -e '.data.token' > /dev/null; then
+            echo "::error::Login failed or did not receive valid auth payload from Claw Cloud API."
+            echo "API Response: $AUTH_PAYLOAD"
             exit 1
           fi
-
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-          echo "Latest digest for ghcr.io/${{ env.IMAGE_TO_CHECK }}:${{ env.IMAGE_TAG }} is ${DIGEST}"
-
-      # 步骤4: 比较新旧Digest，如果不同，则触发部署
-      - name: Compare Digests and Trigger Deploy
-        if: steps.last_digest.outputs.digest != steps.new_digest.outputs.digest
-        run: |
-          echo "✅ New image found! Old: ${{ steps.last_digest.outputs.digest }}, New: ${{ steps.new_digest.outputs.digest }}"
-          echo "Triggering Claw Cloud redeployment..."
-          curl -X POST "${{ secrets.CLAWCLOUD_DEPLOY_HOOK }}"
-          echo "Deployment triggered."
-
-          echo "Updating last_digest.txt with new digest..."
-          echo "${{ steps.new_digest.outputs.digest }}" > last_digest.txt
           
-          # 配置Git，以便能将新Digest写回仓库
+          # 2. 从登录响应中提取完整的授权对象（包含 kubeconfig 和 token）
+          AUTHORIZATION_JSON=$(echo "$AUTH_PAYLOAD" | jq -c '.data')
+
+          # 3. 生成当前的UTC时间戳，格式为 YYYYMMDDHHMMSS
+          RESTART_TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+          
+          # 4. 使用 jq 精确构建我们在浏览器中捕获到的 patch 数据
+          # 我们将 CLAW_CLOUD_PROJECT_NAME 和新的时间戳动态注入
+          REDEPLOY_PAYLOAD=$(jq -n \
+            --arg appName "${{ secrets.CLAW_CLOUD_PROJECT_NAME }}" \
+            --arg restartTime "$RESTART_TIMESTAMP" \
+            '{
+              appName: $appName,
+              patch: [
+                {
+                  type: "patch",
+                  kind: "Deployment",
+                  value: {
+                    spec: {
+                      template: {
+                        metadata: {
+                          labels: {
+                            restartTime: $restartTime
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }')
+
+          # 5. 发送最终的 updateApp 请求！
+          curl -s -X POST 'https://applaunchpad.ap-northeast-1.run.claw.cloud/api/updateApp' \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: $(echo $AUTHORIZATION_JSON | jq -r tostring | jq -sRr @uri)" \
+            -d "$REDEPLOY_PAYLOAD"
+
+          echo "Redeploy API call sent with restartTime ${RESTART_TIMESTAMP}."
+          
+          # 6. 更新本地的 digest 文件以备下次检查
+          echo "Updating digest file..."
+          echo "${{ steps.new_digest.outputs.digest }}" > last_digest.txt
           git config --global user.name 'GitHub Actions Bot'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add last_digest.txt
           git commit -m "Update image digest for ${{ env.IMAGE_TO_CHECK }}"
           git push
-        
-      # 如果Digest相同，则什么都不做
+        env:
+          CLAW_CLOUD_USERNAME: ${{ secrets.CLAW_CLOUD_USERNAME }}
+          CLAW_CLOUD_PASSWORD: ${{ secrets.CLAW_CLOUD_PASSWORD }}
+          CLAW_CLOUD_PROJECT_NAME: ${{ secrets.CLAW_CLOUD_PROJECT_NAME }}
+
+      # 如果 Digest 相同，则什么都不做
       - name: No Update Found
         if: steps.last_digest.outputs.digest == steps.new_digest.outputs.digest
         run: echo "👍 Image is up to date (Digest: ${{ steps.new_digest.outputs.digest }}). No action needed."
