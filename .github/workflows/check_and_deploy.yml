@@ -1,0 +1,59 @@
+name: Check for Docker Image Update and Deploy
+
+on:
+  # 每天的每个小时的第15分钟执行一次 (可以自己调整)
+  schedule:
+    - cron: '15 * * * *'
+  # 也允许手动触发，方便测试
+  workflow_dispatch:
+
+# 环境变量，请修改为您要监控的镜像
+env:
+  IMAGE_TO_CHECK: "jellyfin/jellyfin" # <--- ⚠️ 修改为您要监控的镜像名
+
+jobs:
+  check-for-update:
+    runs-on: ubuntu-latest
+    steps:
+      # 步骤1: 检出当前仓库代码，这样才能读写 last_digest.txt 文件
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      # 步骤2: 读取上一次记录的镜像Digest
+      - name: Read Last Known Digest
+        id: last_digest
+        run: echo "digest=$(cat last_digest.txt)" >> $GITHUB_OUTPUT
+
+      # 步骤3: 从Docker Hub获取最新的镜像Digest
+      # 这是整个脚本的核心，它通过API查询镜像信息
+      - name: Get Latest Image Digest from Docker Hub
+        id: new_digest
+        run: |
+          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${{ env.IMAGE_TO_CHECK }}:pull" | jq -r .token)
+          DIGEST=$(curl -s -H "Accept: application/vnd.docker.distribution.manifest.v2+json" -H "Authorization: Bearer $TOKEN" "https://registry-1.docker.io/v2/${{ env.IMAGE_TO_CHECK }}/manifests/latest" | grep -o 'sha256:[a-f0-9]*' | head -n 1)
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+          echo "Latest digest for ${{ env.IMAGE_TO_CHECK }} is ${DIGEST}"
+
+      # 步骤4: 比较新旧Digest，如果不同，则触发部署
+      - name: Compare Digests and Trigger Deploy
+        if: steps.last_digest.outputs.digest != steps.new_digest.outputs.digest
+        run: |
+          echo "✅ New image found! Old: ${{ steps.last_digest.outputs.digest }}, New: ${{ steps.new_digest.outputs.digest }}"
+          echo "Triggering Claw Cloud redeployment..."
+          curl -X POST "${{ secrets.CLAWCLOUD_DEPLOY_HOOK }}"
+          echo "Deployment triggered."
+
+          echo "Updating last_digest.txt with new digest..."
+          echo "${{ steps.new_digest.outputs.digest }}" > last_digest.txt
+          
+          # 配置Git，以便能将新Digest写回仓库
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'actions@github.com'
+          git add last_digest.txt
+          git commit -m "Update image digest to ${{ steps.new_digest.outputs.digest }}"
+          git push
+        
+      # 如果Digest相同，则什么都不做
+      - name: No Update Found
+        if: steps.last_digest.outputs.digest == steps.new_digest.outputs.digest
+        run: echo "👍 Image is up to date. No action needed."
